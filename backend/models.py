@@ -5,9 +5,14 @@
 from sqlalchemy import Column, String, Integer, Float, Boolean, DateTime, Date, Time, Text, Enum, JSON, ForeignKey, func, CheckConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
-from sqlalchemy.dialects.postgresql import UUID
 import uuid
 from datetime import datetime
+
+# UUID type - use String as fallback if PostgreSQL dialect unavailable
+try:
+    from sqlalchemy.dialects.postgresql import UUID
+except (ImportError, ModuleNotFoundError):
+    UUID = String
 
 Base = declarative_base()
 
@@ -268,7 +273,7 @@ class Itinerary(Base):
     visibility = Column(String(50), default="private")
     flight_booking_id = Column(UUID(as_uuid=True), ForeignKey("flight_bookings.booking_id"), nullable=True)
     hotel_booking_id = Column(UUID(as_uuid=True), ForeignKey("hotel_bookings.booking_id"), nullable=True)
-    status = Column(Enum("confirmed", "cancelled", "completed", "pending"), default="planning", index=True)
+    status = Column(Enum("confirmed", "cancelled", "completed", "pending", "planning"), default="planning", index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -299,7 +304,7 @@ class Payment(Base):
     failure_reason = Column(Text, nullable=True)
     paid_at = Column(DateTime, nullable=True)
     refund_amount = Column(Float, nullable=True)
-    refund_status = Column(Enum("pending", "confirmed", "paid", "refunded", "failed"), nullable=True)
+    refund_status = Column(Enum("pending", "approved", "completed", "denied", "failed"), nullable=True)
     refunded_at = Column(DateTime, nullable=True)
     receipt_url = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
@@ -323,7 +328,7 @@ class Review(Base):
     review_type = Column(Enum("flight", "hotel"), nullable=False)
     flight_id = Column(UUID(as_uuid=True), ForeignKey("flights.flight_id"), nullable=True)
     hotel_id = Column(UUID(as_uuid=True), ForeignKey("hotels.hotel_id"), nullable=True)
-    rating = Column(Integer, nullable=False, CheckConstraint("rating >= 1 AND rating <= 5"))
+    rating = Column(Integer, CheckConstraint("rating >= 1 AND rating <= 5"), nullable=False)
     title = Column(String(255), nullable=True)
     review_text = Column(Text, nullable=False)
     categories = Column(JSON, nullable=True)

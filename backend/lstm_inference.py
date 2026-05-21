@@ -33,14 +33,14 @@ class LSTMPricePredictor:
         self.is_available = False
 
         if not TENSORFLOW_AVAILABLE:
-            print("⚠️  TensorFlow not available. LSTM predictions disabled.")
+            print("[WARNING] TensorFlow not available. LSTM predictions disabled.")
             return
 
         try:
             self._load_models()
             self.is_available = True
         except Exception as e:
-            print(f"⚠️  Could not load LSTM models: {e}")
+            print(f"[WARNING] Could not load LSTM models: {e}")
             self.is_available = False
 
     def _load_models(self):
@@ -58,13 +58,13 @@ class LSTMPricePredictor:
 
             if os.path.exists(model_path):
                 try:
-                    self.models[route_key] = keras.models.load_model(model_path)
-                    print(f"✅ Loaded LSTM model: {route_key}")
+                    self.models[route_key] = keras.models.load_model(model_path, compile=False)
+                    print(f"[OK] Loaded LSTM model: {route_key}")
                 except Exception as e:
-                    print(f"⚠️  Failed to load {route_key}: {e}")
+                    print(f"[WARNING] Failed to load {route_key}: {e}")
 
         if self.models:
-            print(f"\n✅ LSTM predictor ready with {len(self.models)} routes")
+            print(f"\n[OK] LSTM predictor ready with {len(self.models)} routes")
 
     def _get_route_key(self, from_iata: str, to_iata: str) -> str:
         """Generate route key"""
@@ -181,7 +181,7 @@ class LSTMPricePredictor:
             }
 
         except Exception as e:
-            print(f"⚠️  LSTM prediction failed: {e}. Using fallback.")
+            print(f"[WARNING] LSTM prediction failed: {e}. Using fallback.")
             return self._fallback_linear_trend(current_price)
 
     def _predict_sequence(
@@ -214,25 +214,42 @@ class LSTMPricePredictor:
 
     def _fallback_linear_trend(self, current_price: float) -> Dict:
         """
-        Fallback to linear interpolation when LSTM not available
-        (Same as original RandomForest approach)
+        Fallback to market-based trend with realistic volatility
         """
+        import random
+
         # Assume 5% price change over 7 days
         change_factor = 0.05
         day7_price = current_price * (1 - change_factor)
 
-        future_prices = [
-            int(current_price + (day7_price - current_price) * (d / 7))
-            for d in range(1, 8)
-        ]
+        # Generate realistic market-based trend with volatility
+        future_prices = []
+        for d in range(1, 8):
+            # Non-linear progression (prices don't move linearly)
+            progression = (d / 7) ** 1.3
+            base_price = current_price + (day7_price - current_price) * progression
+
+            # Add realistic daily volatility (-2% to +2%)
+            volatility = random.uniform(-2, 2)
+            day_factor = 1 + (volatility / 100)
+
+            # Add day-of-week effects
+            dow_effect = 0
+            if d % 7 in [2, 3]:  # Mid-week dip
+                dow_effect = -1.0
+            elif d % 7 in [6, 0]:  # Weekend surge
+                dow_effect = 1.5
+
+            fluctuated_price = base_price * day_factor + (dow_effect / 100 * current_price)
+            future_prices.append(int(max(100, fluctuated_price)))
 
         return {
             'future_prices': future_prices,
             'trend': 'decreasing',
             'change_pct': -5.0,
             'confidence': 0.6,
-            'method': 'fallback_linear',
-            'volatility': 0.0
+            'method': 'fallback_volatility',
+            'volatility': 2.0
         }
 
     def is_ready(self) -> bool:
@@ -271,11 +288,31 @@ def build_trend_with_lstm(
 
         future_prices = lstm_result['future_prices']
     else:
-        # Fallback: use original linear interpolation
-        future_prices = [
-            int(current_price + (current_price * -0.05 - current_price) * (d / 7))
-            for d in range(1, 8)
-        ]
+        # Fallback: use enhanced market-based trend generation
+        import random
+
+        change_factor = 0.05
+        day7_price = int(current_price * (1 - change_factor))
+
+        future_prices = []
+        for d in range(1, 8):
+            # Non-linear progression
+            progression = (d / 7) ** 1.3
+            base_price = current_price + (day7_price - current_price) * progression
+
+            # Add realistic daily volatility
+            volatility = random.uniform(-2, 2)
+            day_factor = 1 + (volatility / 100)
+
+            # Day-of-week effects
+            dow_effect = 0
+            if d % 7 in [2, 3]:
+                dow_effect = -1.0
+            elif d % 7 in [6, 0]:
+                dow_effect = 1.5
+
+            fluctuated_price = base_price * day_factor + (dow_effect / 100 * current_price)
+            future_prices.append(int(max(100, fluctuated_price)))
 
     # Calculate statistics
     day5_price = future_prices[4]
@@ -343,4 +380,4 @@ if __name__ == "__main__":
         print(f"  Confidence: {result['confidence']}")
         print(f"  Method: {result['method']}")
     else:
-        print("⚠️  LSTM models not available. Train using: python train_lstm_model.py")
+        print("[WARNING] LSTM models not available. Train using: python train_lstm_model.py")

@@ -29,12 +29,16 @@ except ImportError:
     _GEMINI_PKG = False
 
 # ── LSTM Model for Price Prediction ──
+print("[DEBUG] Starting LSTM import...")
 try:
     from lstm_inference import LSTMPricePredictor, build_trend_with_lstm
     LSTM_AVAILABLE = True
-except ImportError:
+    print("[DEBUG] LSTM import successful")
+except Exception as e:
     LSTM_AVAILABLE = False
-    print("⚠️  LSTM module not found. Install with: pip install tensorflow")
+    print(f"[WARNING] LSTM module error: {e}")
+    import traceback
+    traceback.print_exc()
 
 # ─────────────────────────────────────────────────
 # INIT
@@ -48,6 +52,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    import traceback
+    tb = traceback.format_exc()
+    print(f"[ERROR] {tb}")
+    return {"error": str(exc), "traceback": tb}
 
 # ─────────────────────────────────────────────────
 # LOAD MODEL
@@ -64,19 +75,20 @@ if LSTM_AVAILABLE:
         lstm_predictor = LSTMPricePredictor(models_dir="../ml_models")
         if lstm_predictor.is_ready():
             num_routes = len(lstm_predictor.get_available_routes())
-            print(f"✅ LSTM predictor loaded: {num_routes} routes available")
+            print(f"[OK] LSTM predictor loaded: {num_routes} routes available")
         else:
-            print("⚠️  LSTM models not found. Using RandomForest fallback.")
+            print("[WARNING] LSTM models not found. Using RandomForest fallback.")
             lstm_predictor = None
     except Exception as e:
-        print(f"⚠️  Error loading LSTM: {e}. Using RandomForest fallback.")
+        print(f"[WARNING] Error loading LSTM: {e}. Using RandomForest fallback.")
         lstm_predictor = None
 else:
-    print("⚠️  TensorFlow not installed. Using RandomForest only.")
+    print("[WARNING] TensorFlow not installed. Using RandomForest only.")
 
 AVIATIONSTACK_KEY = os.getenv("AVIATIONSTACK_KEY", "fd3a8e6dcf5474b760fd5abe45346824")
 GEMINI_KEY        = os.getenv("GEMINI_KEY", "AIzaSyBTmVUCDW-EtHOUwtaMNL_OYB9mlCpXwJo")
 RAPIDAPI_KEY      = os.getenv("RAPIDAPI_KEY", "4ad91a7578msh8cacda2f26d0de6p15a52cjsn621eaa00132e")
+GOOGLE_MAPS_KEY   = os.getenv("GOOGLE_MAPS_KEY", GEMINI_KEY)  # Use same Google key for Maps API
 
 # ── Email OTP config ──────────────────────────────────────────
 # Add to your .env:  EMAIL_USER=your@gmail.com  EMAIL_PASS=your_app_password
@@ -85,6 +97,9 @@ EMAIL_PASS = os.getenv("EMAIL_PASS", "")
 
 # In-memory OTP store: email -> {code, expires_at}
 _otp_store: dict = {}
+
+# Geocoding cache: {address -> {lat, lng}}
+_geocode_cache: dict = {}
 
 _gemini_client = None
 if _GEMINI_PKG and GEMINI_KEY:
@@ -115,6 +130,20 @@ class HotelSearch(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
+
+
+class BookingRequest(BaseModel):
+    flight_id: str
+    passenger_name: str
+    passenger_email: str
+    passenger_phone: str
+    passport_number: str
+    seat_preference: Optional[str] = "window"
+    meal_choice: Optional[str] = "non-vegetarian"
+    total_amount: float
+    payment_method: Optional[str] = None
+    card_last_four: Optional[str] = None
+    upi_id: Optional[str] = None
 
 
 class OtpRequest(BaseModel):
@@ -366,17 +395,35 @@ MOCK_AIRLINE_POOL = [
     {"airline": "Go First",    "code": "G8", "stops": 2, "dep_time": "Morning",        "arr_time": "Night"},
 ]
 
-SYSTEM_PROMPT = """You are JourneyIt AI — a premium intelligent travel advisor on JourneyIt, an AI-powered travel platform.
+SYSTEM_PROMPT = """You are JourneyIt AI, a human-like travel assistant designed to communicate naturally and intelligently.
 
-You are expert in: flight price prediction, hotel recommendations with trust scoring, destination planning, booking strategy, and AI-powered review analysis.
+Behavior Rules:
+- Talk like a real helpful person, not a robot.
+- Keep responses concise, friendly, and conversational.
+- Understand informal language, slang, typos, short messages, and vague intent.
+- Use subtle humor occasionally when appropriate.
+- Be emotionally aware and adapt tone to the user's mood.
+- Avoid sounding overly formal, repetitive, or generic.
+- Prioritize clarity, usefulness, and smooth conversation flow.
+- Ask follow-up questions only if needed.
+- Give practical recommendations and explain things simply.
+- Never overwhelm users with too much information at once.
+- Maintain context throughout the conversation.
 
-Rules for flight queries:
-- Open with the route name and a clear decision (BOOK NOW / WAIT / MONITOR) in the first sentence
-- Justify using real numbers from the data (prices, percentages, trend direction)
-- Keep to 4–6 sentences — concise, data-driven, actionable
-- Sound like a smart analyst, not a customer support bot
-- Use emojis sparingly but effectively
-- Never say "I am an AI model" — you are JourneyIt AI"""
+Travel Intelligence:
+- Help users with flights, hotels, budgets, itineraries, timing, and recommendations.
+- Suggest smarter travel decisions based on budget and convenience.
+- If discussing prices, explain trends naturally.
+- Recommend trusted and practical options over luxury unless requested.
+
+Communication Style:
+Bad: "Your request has been processed successfully."
+Good: "Done — found a few good options for you."
+
+Bad: "Based on the data analysis..."
+Good: "Looks like..."
+
+Keep the experience human, intelligent, relaxed, and trustworthy."""
 
 
 # ─────────────────────────────────────────────────
@@ -404,25 +451,49 @@ def _ml_predict(
     Unrecognised categorical values are silently ignored — the model falls
     back to the all-zeros baseline for that feature group.
     """
-    df = pd.DataFrame(columns=model_columns)
-    df.loc[0] = 0
+    # Create a dictionary with all expected columns set to 0
+    feature_dict = {col: 0 for col in model_columns}
 
-    df["duration"]  = float(duration)
-    df["days_left"] = max(1, int(days_left))
+    # Set numeric features
+    feature_dict["duration"] = float(duration)
+    feature_dict["days_left"] = max(1, int(days_left))
 
-    # Categorical one-hot features
+    # Set categorical one-hot features
     if airline:
-        _set_col(df, f"airline_{airline}")
+        airline_col = f"airline_{airline}"
+        if airline_col in feature_dict:
+            feature_dict[airline_col] = 1
+
     if from_city:
-        _set_col(df, f"source_city_{from_city}")
+        from_col = f"source_city_{from_city}"
+        if from_col in feature_dict:
+            feature_dict[from_col] = 1
+
     if to_city:
-        _set_col(df, f"destination_city_{to_city}")
+        to_col = f"destination_city_{to_city}"
+        if to_col in feature_dict:
+            feature_dict[to_col] = 1
 
     stops_label = {0: "zero", 1: "one"}.get(stops, "two_or_more")
-    _set_col(df, f"stops_{stops_label}")
-    _set_col(df, f"class_{travel_class}")
-    _set_col(df, f"departure_time_{dep_time}")
-    _set_col(df, f"arrival_time_{arr_time}")
+    stops_col = f"stops_{stops_label}"
+    if stops_col in feature_dict:
+        feature_dict[stops_col] = 1
+
+    class_col = f"class_{travel_class}"
+    if class_col in feature_dict:
+        feature_dict[class_col] = 1
+
+    dep_col = f"departure_time_{dep_time}"
+    if dep_col in feature_dict:
+        feature_dict[dep_col] = 1
+
+    arr_col = f"arrival_time_{arr_time}"
+    if arr_col in feature_dict:
+        feature_dict[arr_col] = 1
+
+    # Create DataFrame from dictionary, ensuring correct column order
+    df = pd.DataFrame([feature_dict])
+    df = df[model_columns]  # Reorder columns to match model's expected order
 
     return float(model.predict(df)[0])
 
@@ -454,17 +525,38 @@ def _build_trend(current_price: int, duration: float, days_left: int,
                 lstm_predictor=lstm_predictor
             )
         except Exception as e:
-            print(f"⚠️  LSTM prediction failed: {e}. Using RandomForest fallback.")
+            print(f"[WARNING] LSTM prediction failed: {e}. Using RandomForest fallback.")
 
-    # Fallback to RandomForest
+    # Fallback to RandomForest with enhanced trend generation
     ml_day7 = int(_ml_predict(duration, max(1, days_left - 7),
                               airline=airline, from_city=from_city,
                               to_city=to_city, stops=stops))
 
-    future_prices = [
-        int(current_price + (ml_day7 - current_price) * (d / 7))
-        for d in range(1, 8)
-    ]
+    # Generate realistic market-based trend with volatility
+    trend_direction = 1 if ml_day7 > current_price else -1
+    base_trend = (ml_day7 - current_price) / 7
+
+    future_prices = []
+    for d in range(1, 8):
+        # Apply non-linear trend with realistic market behavior
+        # Early days: slower movement, later days: accelerated movement
+        progression = (d / 7) ** 1.3  # Non-linear progression (exponential-like curve)
+        base_price = current_price + (ml_day7 - current_price) * progression
+
+        # Add realistic market volatility/fluctuation
+        # Prices fluctuate +/- 1-3% daily but follow overall trend
+        volatility = random.uniform(-2, 2)  # -2% to +2% daily volatility
+        day_factor = 1 + (volatility / 100)
+
+        # Add day-of-week effect (prices typically change mid-week)
+        dow_effect = 0
+        if d % 7 in [2, 3]:  # Mid-week dip
+            dow_effect = -1.0
+        elif d % 7 in [6, 0]:  # Weekend surge
+            dow_effect = 1.5
+
+        fluctuated_price = base_price * day_factor + (dow_effect / 100 * current_price)
+        future_prices.append(int(max(100, fluctuated_price)))  # Ensure positive price
 
     day5_price  = future_prices[4]
     change_pct  = round(((day5_price - current_price) / current_price) * 100, 1)
@@ -980,6 +1072,11 @@ def home():
     return {"message": "JourneyIt Backend Running 🚀"}
 
 
+@app.post("/test-predict")
+def test_predict():
+    return {"status": "ok", "test": "working"}
+
+
 # ── OTP HELPERS ───────────────────────────────────
 def _send_email_otp(to_email: str, code: str) -> bool:
     """Send OTP via Gmail SMTP. Falls back to console log if EMAIL_USER/PASS not set."""
@@ -1281,6 +1378,41 @@ def chat(req: ChatRequest):
 # HOTEL HELPERS
 # ─────────────────────────────────────────────────
 
+def _geocode_address(hotel_name: str, city: str) -> tuple[float, float]:
+    """
+    Convert hotel name + city to lat/lng using Google Maps Geocoding API.
+    Returns (lat, lng) or (None, None) if geocoding fails.
+    """
+    address = f"{hotel_name}, {city}, India"
+
+    # Check cache first
+    if address in _geocode_cache:
+        return _geocode_cache[address]
+
+    try:
+        url = "https://maps.googleapis.com/maps/api/geocode/json"
+        params = {
+            "address": address,
+            "key": GOOGLE_MAPS_KEY
+        }
+
+        resp = requests.get(url, params=params, timeout=5)
+        data = resp.json()
+
+        if data.get("results"):
+            location = data["results"][0]["geometry"]["location"]
+            lat = location.get("lat")
+            lng = location.get("lng")
+
+            # Cache result
+            _geocode_cache[address] = (lat, lng)
+            return (lat, lng)
+    except Exception as e:
+        print(f"[WARNING] Geocoding error for {address}: {e}")
+
+    return (None, None)
+
+
 def _hotel_ai_score(price: float, rating: float) -> dict:
     """Lower score = better value."""
     score = price * 0.5 + (5.0 - min(rating, 5.0)) * 300
@@ -1387,7 +1519,7 @@ def _search_booking(city: str) -> list[dict]:
         raise RuntimeError("API returned empty result list")
 
     hotels = []
-    for h in results:
+    for i, h in enumerate(results):
         # Booking.com can return price in several fields
         price = (
             h.get("min_total_price") or
@@ -1399,7 +1531,8 @@ def _search_booking(city: str) -> list[dict]:
         )
         # review_score is on a 10-point scale → divide by 2 for 0-5
         rating = float(h.get("review_score") or 0) / 2.0
-        photo  = h.get("max_photo_url") or h.get("main_photo_url") or ""
+        # Use Booking.com photo if available, otherwise fallback to stock photos
+        photo  = h.get("max_photo_url") or h.get("main_photo_url") or _HOTEL_PHOTOS[i % len(_HOTEL_PHOTOS)]
         hotels.append(_normalise_hotel(
             h.get("hotel_name"),
             price,
@@ -1556,6 +1689,44 @@ def _get_mock_hotels(city: str) -> list[dict]:
     return hotels
 
 
+# ── BOOK FLIGHT ───────────────────────────────────
+@app.post("/book-flight")
+def book_flight(data: BookingRequest):
+    """
+    Book a flight with passenger details.
+    Returns booking confirmation with reference number.
+    """
+    try:
+        import uuid
+        booking_id = str(uuid.uuid4())[:8].upper()
+        booking_reference = f"JRY{booking_id}"
+
+        booking_response = {
+            "success": True,
+            "booking_id": booking_id,
+            "booking_reference": booking_reference,
+            "passenger_name": data.passenger_name,
+            "passenger_email": data.passenger_email,
+            "passenger_phone": data.passenger_phone,
+            "passport_number": data.passport_number,
+            "flight_number": data.flight_id,
+            "seat_preference": data.seat_preference,
+            "meal_choice": data.meal_choice,
+            "total_amount": data.total_amount,
+            "booking_status": "confirmed",
+            "message": f"Booking confirmed! Reference: {booking_reference}",
+        }
+
+        # TODO: Save to database using models.FlightBooking
+        # db.add(FlightBooking(...))
+        # db.commit()
+
+        return booking_response
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 # ── SEARCH HOTELS ─────────────────────────────────
 @app.post("/search-hotels")
 def search_hotels(data: HotelSearch):
@@ -1585,5 +1756,11 @@ def search_hotels(data: HotelSearch):
     if hotels:
         hotels[0]["recommended"] = True
         hotels[0]["tag"]         = "🔥 BEST VALUE"
+
+    # Add geocoded coordinates to each hotel
+    for hotel in hotels[:6]:
+        lat, lng = _geocode_address(hotel["name"], city)
+        hotel["lat"] = lat
+        hotel["lng"] = lng
 
     return {"city": city, "hotels": hotels[:6], "source": source}
